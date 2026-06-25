@@ -2,11 +2,12 @@ import os
 import sys
 import getpass
 import oracledb
+import time
 from pathlib import Path
 
 # user config
 CONFIG = {
-    "db_user": "your_username",
+    "db_user": "SYSTEM",
     "db_dsn": "localhost:1521/XEPDB1", # host:port/service_name
     "output_dir": "./output",
     "batch_size": 100,
@@ -33,7 +34,7 @@ def discover_blob_columns(conn):
         SELECT owner, table_name, column_name
         FROM all_tab_columns
         WHERE data_type = 'BLOB'
-          AND owner NOT IN ('SYS','SYSTEM','XDB','DBSNMP','OJVMSYS',
+          AND owner NOT IN ('SYS','XDB','DBSNMP','OJVMSYS',
                             'AUDSYS','GSMADMIN_INTERNAL','ORACLE_OCM')
         ORDER BY owner, table_name, column_name
     """
@@ -54,37 +55,46 @@ pdf_magic = b"%PDF"
 def extract_pdfs(conn, columns):
     out_dir = Path(CONFIG["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
-
+    start = time.time()
     total = 0
+    total_bytes = 0
 
     for owner, table, col in columns:
         pk_col = find_pk(conn, owner, table)
         query = f'SELECT {pk_col}, "{col}" FROM "{owner}"."{table}" WHERE "{col}" IS NOT NULL'
+        print(f"\nScanning: {owner}.{table}.{col}...")
 
         with conn.cursor() as cursor:
             cursor.execute(query)
-            while True:
-                rows = cursor.fetchmany(CONFIG["batch_size"])
-                if not rows:
-                    break
-                for row in rows:
-                    pk_val, blob = row
-                    if not blob:
-                        continue
-                    header = blob.read(5)
-                    if header != pdf_magic:
-                        continue
+            rows = cursor.fetchall()
+            found = 0
+            skipped = 0
+            for pk_val, blob in rows:
+                if not blob:
+                    skipped += 1
+                    continue
 
-                    filename = f"{table}_{pk_val}_{col}.pdf"
-                    filename = out_dir / filename
-                    with open(filename, "wb") as f:
-                        f.write(header)
-                        while chunk:= blob.read(CONFIG["chunk_size"]):
-                            f.write(chunk)
-                        total += 1
-                        print(f" [{total}] Saved: {filename}")
-    print(f"\nDone. {total} PDF(s) extracted to {out_dir}")
+                raw = blob if isinstance(blob, bytes) else blob.read()
+                if raw[:4] != pdf_magic:
+                    skipped += 1
+                    continue
 
+                filepath = out_dir / f"{table}_{pk_val}_{col}.pdf"
+                with open(filepath, "wb") as f:
+                    f.write(raw)
+                total += 1
+                total_bytes += len(raw)
+                found += 1
+                size_kb = len(raw) / 1024
+                print(f"  [{total}] PDF found ({size_kb:.1f}KB) → {filepath.name}")
+
+            if skipped:
+                print(f"  Skipped {skipped} row(s) (not PDF)")
+
+    elapsed = time.time() - start
+    total_mb = total_bytes / (1024 * 1024)
+    print(f"\nDone in {elapsed:.1f}s | {total} PDF(s), {total_mb:.2f}MB extracted → {out_dir}")
+    
 def find_pk(conn, owner, table):
     query = """
         SELECT cols.column_name
@@ -92,15 +102,15 @@ def find_pk(conn, owner, table):
         WHERE cons.constraint_type = 'P'
           AND cons.owner = cols.owner
           AND cons.constraint_name = cols.constraint_name
-          AND cols.owner = :owner
-          AND cols.table_name = :table
+          AND cols.owner = :owner_name
+          AND cols.table_name = :table_name
     """
     with conn.cursor() as cursor:
-        cursor.execute(query, owner=owner, table=table)
+        cursor.execute(query, owner_name=owner, table_name=table)
         row = cursor.fetchone()
         if row:
             return row[0]
-        return "ROWID"  # fallback
+        return "ROWID"
     
 if __name__ == "__main__":
     conn = get_connection()
